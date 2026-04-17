@@ -1,0 +1,73 @@
+# Python Version Management
+.python-version
+.pyenv
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / Packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+
+# Data & Datasets
+datasets/
+data/
+*.csv
+*.xlsx
+*.jpg
+*.png
+*.mp4
+*.avi
+*.mov
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment Variables
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+IDLRW-DATASET/
+IDLRW-DATASET.zip
+*.avi
+*.mp4
+*.mov
