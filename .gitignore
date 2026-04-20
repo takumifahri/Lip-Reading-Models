@@ -1,73 +1,86 @@
-# Python Version Management
-.python-version
-.pyenv
+# ============ ML MODELS & WEIGHTS ============
+*.task                 # MediaPipe models (face_landmarker.task)
+*.h5                   # Keras models
+*.pt
+*.pth
+*.onnx
+*.pb
+*.tflite
+models/                # Seluruh folder models
 
-# Virtual Environments
-venv/
-ENV/
-env/
-.venv/
+# ============ DATA ARRAYS & FEATURES ============
+*.npy                  # NumPy landmark arrays (OUTPUT dari DataCollect.py v3!)
+*.npz
 
-# Python Cache
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+# ============ LOGS & EXPERIMENTS ============
+logs/
+runs/
+*.log
+wandb/
+.wandb/
 
-# Distribution / Packaging
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# IDE & Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-.project
-.pydevproject
-
-# Data & Datasets
-datasets/
-data/
-*.csv
-*.xlsx
-*.jpg
-*.png
-*.mp4
-*.avi
-*.mov
-
-# Jupyter Notebook
+# ============ NOTEBOOKS ============
+# Keep .ipynb files, tapi ignore checkpoint
 .ipynb_checkpoints/
-*.ipynb_checkpoints
+*/.ipynb_checkpoints/
 
-# Environment Variables
-.env
-.env.local
+# ============ JUPYTER SPECIFIC ============
+.jupyter/
+.ipython/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Project Specific
+# ============ LARGE DATASETS ============
 IDLRW-DATASET/
 IDLRW-DATASET.zip
-*.avi
-*.mp4
-*.mov
+indonesian_lipreading_dataset_py311/
+
+# ============ CACHE ============
+.keras/
+.cache/
+*_cache/
+__pycache__/
+
+# ============ TENSORFLOW/ML ============
+.tensorflow/
+.tflite_cache/
+.tf_models/
+
+# ============ ADDED: LIP READING ML PROJECT ============
+
+# Model Weights & Artifacts
+*.task
+*.h5
+*.pt
+*.pth
+*.onnx
+*.pb
+*.tflite
+models/                    # Keep folder, ignore contents
+
+# Data & Arrays
+*.npy                      # Landmark arrays dari DataCollect.py v3
+*.npz
+
+# ML Training
+logs/
+runs/
+*.log
+wandb/
+.wandb/
+
+# Cache & Build
+.keras/
+.tensorflow/
+.cache/
+*_cache/
+.pytest_cache/
+
+# Jupyter
+.jupyter/
+.ipython/
+
+# Large external datasets
+IDLRW-DATASET/
+IDLRW-DATASET.zip
+indonesian_lipreading_dataset_py311/
+datasets
+.venv
