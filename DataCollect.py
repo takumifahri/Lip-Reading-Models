@@ -2,17 +2,18 @@
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║                  LIP READING DATA COLLECTOR v3.0+                         ║
 ║                Visual Komputer Cerdas Project - Lip Recognition           ║
-║        Python 3.11.9 | MediaPipe Face Mesh (40 lip + teeth + corners)    ║
+║     Python 3.11.9 | MediaPipe Face Mesh (Mouth-Focused Region Only)      ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 
-FEATURES v3.0:
+FEATURES v3.0 (Mouth-Focused - No Cheeks/Eyes):
 ✓ MediaPipe Face Mesh (40 detailed lip landmarks)
 ✓ Teeth boundary detection (8 landmarks) - untuk /s/, /z/, /f/, /v/
+✓ Tongue tracking (8 landmarks) - capture tongue position & shape
 ✓ Mouth corner tracking (2 landmarks) - untuk /p/, /m/ rounding
 ✓ Derived features: aperture, mouth_width, teeth_visibility, etc
-✓ Real-time visualization with teeth + corners
+✓ TIGHT ROI CROPPING - Mouth region only (excludes cheeks & eyes)
 ✓ Multi-format export: .mp4 + .npy + .csv + .json
-✓ Consonant-optimized: /p/, /b/, /m/, /f/, /v/, /s/, /z/ ready
+✓ Consonant & vowel optimized with tongue data
 """
 
 import cv2
@@ -23,6 +24,8 @@ import csv
 import time
 import os
 import sys
+import threading
+import queue
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -33,7 +36,7 @@ from typing import Optional, Dict, List, Tuple
 
 class Config:
     """Global configuration"""
-    RECORD_DURATION = 10
+    RECORD_DURATION = 20
     TARGET_FPS = 30
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
@@ -43,6 +46,11 @@ class Config:
     # MediaPipe settings
     MIN_DETECTION_CONFIDENCE = 0.7
     MIN_TRACKING_CONFIDENCE = 0.5
+    
+    # ✓ OPTIMIZATION: Save frames async (tidak block recording loop)
+    SAVE_FRAMES_ASYNC = True
+    SAVE_FRAME_QUALITY = 80  # Lower quality = faster write
+    SKIP_DISPLAY_DRAW = True  # Don't draw landmarks on display - expensive!
     
     # 40 Lip landmarks (outer + inner)
     LIP_LANDMARKS = [
@@ -60,6 +68,14 @@ class Config:
         361, 360, 359, 358       # Bottom teeth
     ]
     
+    # 8 Tongue landmarks (center region) - untuk vowel & consonant articulation
+    # Tongue tip, center, base positions
+    TONGUE_LANDMARKS = [
+        82, 86, 87,              # Tongue center region (3)
+        83, 84, 85,              # Tongue sides (3)
+        180, 179                 # Tongue base (2)
+    ]
+    
     # 2 Mouth corners (lip commissures) - untuk /p/, /m/ rounding
     MOUTH_CORNERS = [
         61, 291  # Left corner, Right corner
@@ -73,11 +89,15 @@ class Config:
     COLOR_LIP_OUTER = (0, 255, 128)      # Green
     COLOR_LIP_INNER = (255, 0, 128)      # Magenta
     COLOR_TEETH = (200, 200, 255)        # Light red
+    COLOR_TONGUE = (100, 150, 255)       # Light orange-red (tongue)
     COLOR_CORNERS = (0, 200, 255)        # Orange
     COLOR_OUTLINE = (0, 200, 255)
     COLOR_TEXT_WHITE = (255, 255, 255)
     COLOR_RECORDING = (0, 0, 220)
     COLOR_OVERLAY = (20, 20, 20)
+    
+    # ✓ MOUTH-FOCUSED ROI: Minimal padding to exclude cheeks/eyes
+    ROI_PADDING = 15  # Tight crop (was 30) - focus on mouth only
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -112,152 +132,126 @@ def setup_directories(label: str, session_id: Optional[str] = None) -> Dict[str,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MEDIAPIPE PROCESSOR - ENHANCED
+#  MEDIAPIPE PROCESSOR - mp.solutions.face_mesh (Legacy API)
 # ═════════════════════════════════════════════════════════════════════════════
 
+mp_face_mesh = mp.solutions.face_mesh
+
 class MediaPipeProcessor:
-    """MediaPipe Face Mesh - 40 lip + 8 teeth + 2 corners + derived features"""
+    """MediaPipe Face Mesh (mp.solutions) - 40 lip + 8 teeth + 8 tongue + 2 corners + derived features"""
     
     def __init__(self):
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
+        # Use mp.solutions.face_mesh — no external .task model file needed
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,       # Video mode (uses tracking between frames)
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=True,         # Enables iris & lip detail refinement
             min_detection_confidence=Config.MIN_DETECTION_CONFIDENCE,
             min_tracking_confidence=Config.MIN_TRACKING_CONFIDENCE,
         )
     
     def extract_derived_features(self, landmarks, h: int, w: int) -> Dict:
+        """Extract 9 derived features from face mesh landmarks.
+        
+        Args:
+            landmarks: MediaPipe face_mesh landmark list (result.multi_face_landmarks[0].landmark)
+            h: frame height in pixels
+            w: frame width in pixels
+        
+        Returns:
+            Dict with 9 derived metrics for consonant/vowel distinction.
         """
-        Extract derived features untuk consonant distinction:
-        1. aperture_height - mouth opening (distinguish /æ/ vs /ə/)
-        2. mouth_width - lip rounding (distinguish /p/ vs /b/)
-        3. teeth_visibility - visibility ratio (/s/, /z/ have exposed teeth)
-        4. mouth_corners_distance - lip compression (/p/, /m/ rounded)
-        5. lip_protrusion - forward/backward (/f/, /v/ need contact)
-        6. inner_outer_ratio - detail level
-        7. top_aperture_width - top mouth opening
-        8. bottom_aperture_width - bottom mouth opening
-        9. vertical_asymmetry - jaw position
-        """
+        def _px(idx):
+            """Get pixel coordinates for a landmark index."""
+            lm = landmarks[idx]
+            return (int(lm.x * w), int(lm.y * h))
         
-        features = {}
+        def _dist(p1, p2):
+            """Euclidean distance between two pixel coordinate tuples."""
+            return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
         
-        # Get pixel coordinates untuk calculations
-        aperture_top_pts = []
-        aperture_bottom_pts = []
-        teeth_pts = []
-        corner_pts = []
+        # --- 1. Aperture Height (vertical mouth opening) ---
+        # Average distance between inner top and inner bottom lip landmarks
+        aperture_heights = []
+        for top_idx, bot_idx in zip(Config.APERTURE_TOP, Config.APERTURE_BOTTOM):
+            aperture_heights.append(_dist(_px(top_idx), _px(bot_idx)))
+        aperture_height = sum(aperture_heights) / len(aperture_heights) if aperture_heights else 0
         
-        for idx in Config.APERTURE_TOP:
-            landmark = landmarks.landmark[idx]
-            aperture_top_pts.append([landmark.x * w, landmark.y * h])
+        # --- 2. Mouth Width (corners distance) ---
+        left_corner = _px(Config.MOUTH_CORNERS[0])   # landmark 61
+        right_corner = _px(Config.MOUTH_CORNERS[1])   # landmark 291
+        mouth_width = _dist(left_corner, right_corner)
         
-        for idx in Config.APERTURE_BOTTOM:
-            landmark = landmarks.landmark[idx]
-            aperture_bottom_pts.append([landmark.x * w, landmark.y * h])
+        # --- 3. Teeth Visibility ---
+        # Average Z-depth difference between top and bottom teeth landmarks
+        # Lower Z = closer to camera = more visible
+        top_teeth_z = [landmarks[idx].z for idx in Config.TEETH_LANDMARKS[:4]]
+        bot_teeth_z = [landmarks[idx].z for idx in Config.TEETH_LANDMARKS[4:]]
+        avg_teeth_z = (sum(top_teeth_z) + sum(bot_teeth_z)) / len(Config.TEETH_LANDMARKS)
+        # Compute visibility relative to lip center z
+        lip_center_z = landmarks[13].z  # Center upper inner lip
+        teeth_visibility = max(0.0, lip_center_z - avg_teeth_z)  # Positive = teeth in front
         
-        for idx in Config.TEETH_LANDMARKS:
-            landmark = landmarks.landmark[idx]
-            teeth_pts.append([landmark.x * w, landmark.y * h])
+        # --- 4. Corners Distance (redundant with mouth_width but kept for compat) ---
+        corners_distance = mouth_width
         
-        for idx in Config.MOUTH_CORNERS:
-            landmark = landmarks.landmark[idx]
-            corner_pts.append([landmark.x * w, landmark.y * h])
+        # --- 5. Protrusion Z (lip protrusion / puckering) ---
+        # Average Z of outer lip vs average Z of inner lip
+        outer_z = [landmarks[idx].z for idx in Config.LIP_LANDMARKS[:20]]
+        inner_z = [landmarks[idx].z for idx in Config.LIP_LANDMARKS[20:]]
+        avg_outer_z = sum(outer_z) / len(outer_z)
+        avg_inner_z = sum(inner_z) / len(inner_z)
+        protrusion_z = avg_outer_z - avg_inner_z  # Negative = inner lip protrudes
         
-        aperture_top_pts = np.array(aperture_top_pts)
-        aperture_bottom_pts = np.array(aperture_bottom_pts)
-        teeth_pts = np.array(teeth_pts)
-        corner_pts = np.array(corner_pts)
+        # --- 6. Lip Detail Ratio (aspect ratio: width / height) ---
+        lip_detail_ratio = (mouth_width / aperture_height) if aperture_height > 1e-6 else 0
         
-        # 1. APERTURE HEIGHT (vertical distance between inner lips)
-        if len(aperture_top_pts) > 0 and len(aperture_bottom_pts) > 0:
-            top_y = np.mean(aperture_top_pts[:, 1])
-            bottom_y = np.mean(aperture_bottom_pts[:, 1])
-            aperture_height = abs(bottom_y - top_y)
-            features['aperture_height'] = float(aperture_height)
-        else:
-            features['aperture_height'] = 0.0
+        # --- 7. Top Aperture Width ---
+        # Horizontal distance across the top inner lip edge
+        top_left = _px(Config.APERTURE_TOP[0])
+        top_right = _px(Config.APERTURE_TOP[-1])
+        top_aperture_width = _dist(top_left, top_right)
         
-        # 2. MOUTH WIDTH (distance between left and right corners)
-        if len(corner_pts) == 2:
-            mouth_width = abs(corner_pts[1][0] - corner_pts[0][0])
-            features['mouth_width'] = float(mouth_width)
-        else:
-            features['mouth_width'] = 0.0
+        # --- 8. Bottom Aperture Width ---
+        bot_left = _px(Config.APERTURE_BOTTOM[0])
+        bot_right = _px(Config.APERTURE_BOTTOM[-1])
+        bottom_aperture_width = _dist(bot_left, bot_right)
         
-        # 3. TEETH VISIBILITY RATIO
-        # Distance from aperture to teeth (small = more visible, good for /s/, /z/)
-        if len(teeth_pts) > 0 and len(aperture_bottom_pts) > 0:
-            avg_teeth_y = np.mean(teeth_pts[:, 1])
-            avg_aperture_bottom_y = np.mean(aperture_bottom_pts[:, 1])
-            teeth_visibility = max(0, avg_aperture_bottom_y - avg_teeth_y)
-            features['teeth_visibility'] = float(teeth_visibility)
-        else:
-            features['teeth_visibility'] = 0.0
+        # --- 9. Vertical Asymmetry ---
+        # Difference between left and right side aperture heights
+        # Uses the first and last aperture pairs
+        left_height = _dist(_px(Config.APERTURE_TOP[0]), _px(Config.APERTURE_BOTTOM[0]))
+        right_height = _dist(_px(Config.APERTURE_TOP[-1]), _px(Config.APERTURE_BOTTOM[-1]))
+        vertical_asymmetry = abs(left_height - right_height)
         
-        # 4. MOUTH CORNERS DISTANCE (lip compression degree)
-        # For /p/, /m/ = lips more compressed (smaller distance)
-        if len(corner_pts) == 2:
-            # Normalize by mouth width
-            corners_dist = np.linalg.norm(corner_pts[1] - corner_pts[0])
-            features['corners_distance'] = float(corners_dist)
-        else:
-            features['corners_distance'] = 0.0
-        
-        # 5. LIP PROTRUSION (how forward lips are)
-        # Using depth (z) component from MediaPipe
-        if len(aperture_bottom_pts) > 0:
-            protrusion_pts = []
-            for idx in Config.APERTURE_BOTTOM:
-                landmark = landmarks.landmark[idx]
-                protrusion_pts.append(landmark.z)
-            features['protrusion_z'] = float(np.mean(protrusion_pts))
-        else:
-            features['protrusion_z'] = 0.0
-        
-        # 6. INNER-OUTER LIP RATIO
-        inner_pts_count = len(aperture_top_pts) + len(aperture_bottom_pts)
-        outer_pts_count = 20  # Fixed
-        features['lip_detail_ratio'] = float(inner_pts_count / (outer_pts_count + 1))
-        
-        # 7. TOP APERTURE WIDTH (width of upper inner aperture)
-        if len(aperture_top_pts) > 1:
-            top_width = abs(aperture_top_pts[-1][0] - aperture_top_pts[0][0])
-            features['top_aperture_width'] = float(top_width)
-        else:
-            features['top_aperture_width'] = 0.0
-        
-        # 8. BOTTOM APERTURE WIDTH
-        if len(aperture_bottom_pts) > 1:
-            bottom_width = abs(aperture_bottom_pts[-1][0] - aperture_bottom_pts[0][0])
-            features['bottom_aperture_width'] = float(bottom_width)
-        else:
-            features['bottom_aperture_width'] = 0.0
-        
-        # 9. VERTICAL ASYMMETRY (jaw tilt indicator)
-        # Difference in lip heights at left vs right
-        if len(aperture_top_pts) > 0:
-            left_y = aperture_top_pts[0][1]
-            right_y = aperture_top_pts[-1][1]
-            asymmetry = abs(right_y - left_y)
-            features['vertical_asymmetry'] = float(asymmetry)
-        else:
-            features['vertical_asymmetry'] = 0.0
-        
-        return features
+        return {
+            'aperture_height': round(aperture_height, 2),
+            'mouth_width': round(mouth_width, 2),
+            'teeth_visibility': round(teeth_visibility, 6),
+            'corners_distance': round(corners_distance, 2),
+            'protrusion_z': round(protrusion_z, 6),
+            'lip_detail_ratio': round(lip_detail_ratio, 4),
+            'top_aperture_width': round(top_aperture_width, 2),
+            'bottom_aperture_width': round(bottom_aperture_width, 2),
+            'vertical_asymmetry': round(vertical_asymmetry, 2),
+        }
     
     def process_frame(self, frame: np.ndarray) -> Optional[Dict]:
-        """Extract 40 lip + 8 teeth + features dari frame"""
+        """Extract 40 lip + 8 teeth + 8 tongue + 2 corners + features dari frame"""
+        h, w = frame.shape[:2]
+        
+        # Convert BGR → RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame.flags.writeable = False  # Performance optimization
+        
         results = self.face_mesh.process(rgb_frame)
         
         if not results.multi_face_landmarks:
             return None
         
-        landmarks = results.multi_face_landmarks[0]
-        h, w = frame.shape[:2]
+        # Get the first face's landmarks
+        face_landmarks = results.multi_face_landmarks[0]
+        landmarks_list = face_landmarks.landmark
         
         normalized_coords = []
         pixel_coords = []
@@ -265,23 +259,23 @@ class MediaPipeProcessor:
         
         # ===== LIP LANDMARKS (40) =====
         for idx in Config.LIP_LANDMARKS:
-            landmark = landmarks.landmark[idx]
+            lm = landmarks_list[idx]
             
             normalized_coords.append({
                 'idx': idx,
-                'x': landmark.x,
-                'y': landmark.y,
-                'z': landmark.z,
+                'x': lm.x,
+                'y': lm.y,
+                'z': lm.z,
                 'type': 'lip'
             })
             
-            px = int(landmark.x * w)
-            py = int(landmark.y * h)
+            px = int(lm.x * w)
+            py = int(lm.y * h)
             pixel_coords.append({
                 'idx': idx,
                 'x': px,
                 'y': py,
-                'z': landmark.z,
+                'z': lm.z,
                 'type': 'lip'
             })
             
@@ -291,23 +285,23 @@ class MediaPipeProcessor:
         # ===== TEETH LANDMARKS (8) =====
         teeth_coords_pixel = []
         for idx in Config.TEETH_LANDMARKS:
-            landmark = landmarks.landmark[idx]
+            lm = landmarks_list[idx]
             
             normalized_coords.append({
                 'idx': idx,
-                'x': landmark.x,
-                'y': landmark.y,
-                'z': landmark.z,
+                'x': lm.x,
+                'y': lm.y,
+                'z': lm.z,
                 'type': 'teeth'
             })
             
-            px = int(landmark.x * w)
-            py = int(landmark.y * h)
+            px = int(lm.x * w)
+            py = int(lm.y * h)
             pixel_coords.append({
                 'idx': idx,
                 'x': px,
                 'y': py,
-                'z': landmark.z,
+                'z': lm.z,
                 'type': 'teeth'
             })
             
@@ -318,23 +312,23 @@ class MediaPipeProcessor:
         # ===== MOUTH CORNERS (2) =====
         corners_pixel = []
         for idx in Config.MOUTH_CORNERS:
-            landmark = landmarks.landmark[idx]
+            lm = landmarks_list[idx]
             
             normalized_coords.append({
                 'idx': idx,
-                'x': landmark.x,
-                'y': landmark.y,
-                'z': landmark.z,
+                'x': lm.x,
+                'y': lm.y,
+                'z': lm.z,
                 'type': 'corner'
             })
             
-            px = int(landmark.x * w)
-            py = int(landmark.y * h)
+            px = int(lm.x * w)
+            py = int(lm.y * h)
             pixel_coords.append({
                 'idx': idx,
                 'x': px,
                 'y': py,
-                'z': landmark.z,
+                'z': lm.z,
                 'type': 'corner'
             })
             
@@ -342,8 +336,35 @@ class MediaPipeProcessor:
             xs.append(px)
             ys.append(py)
         
-        # Calculate ROI bounding box
-        padding = 30
+        # ===== TONGUE LANDMARKS (8) =====
+        tongue_coords_pixel = []
+        for idx in Config.TONGUE_LANDMARKS:
+            lm = landmarks_list[idx]
+            
+            normalized_coords.append({
+                'idx': idx,
+                'x': lm.x,
+                'y': lm.y,
+                'z': lm.z,
+                'type': 'tongue'
+            })
+            
+            px = int(lm.x * w)
+            py = int(lm.y * h)
+            pixel_coords.append({
+                'idx': idx,
+                'x': px,
+                'y': py,
+                'z': lm.z,
+                'type': 'tongue'
+            })
+            
+            tongue_coords_pixel.append((px, py))
+            xs.append(px)
+            ys.append(py)
+        
+        # ✓ MOUTH-FOCUSED ROI CALCULATION: Tight padding to exclude cheeks/eyes
+        padding = Config.ROI_PADDING
         x_min = max(0, min(xs) - padding)
         y_min = max(0, min(ys) - padding)
         x_max = min(w, max(xs) + padding)
@@ -359,7 +380,7 @@ class MediaPipeProcessor:
         }
         
         # Extract derived features
-        derived_features = self.extract_derived_features(landmarks, h, w)
+        derived_features = self.extract_derived_features(landmarks_list, h, w)
         
         return {
             'normalized': normalized_coords,
@@ -369,11 +390,14 @@ class MediaPipeProcessor:
             'timestamp': datetime.now().isoformat(),
             'teeth_coords': teeth_coords_pixel,
             'corners_coords': corners_pixel,
+            'tongue_coords': tongue_coords_pixel,
         }
     
     def close(self):
-        if self.face_mesh:
+        """Release MediaPipe FaceMesh resources"""
+        if hasattr(self, 'face_mesh') and self.face_mesh is not None:
             self.face_mesh.close()
+            self.face_mesh = None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -381,7 +405,7 @@ class MediaPipeProcessor:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def draw_landmarks(frame: np.ndarray, landmark_data: Dict) -> np.ndarray:
-    """Draw 40 lip + 8 teeth + 2 corners + ROI box"""
+    """Draw 40 lip + 8 teeth + 2 corners + 8 tongue + tight mouth ROI box"""
     if landmark_data is None:
         return frame
     
@@ -405,6 +429,9 @@ def draw_landmarks(frame: np.ndarray, landmark_data: Dict) -> np.ndarray:
         elif coord_type == 'teeth':
             color = Config.COLOR_TEETH
             radius = 3
+        elif coord_type == 'tongue':
+            color = Config.COLOR_TONGUE
+            radius = 3
         elif coord_type == 'corner':
             color = Config.COLOR_CORNERS
             radius = 4
@@ -414,7 +441,7 @@ def draw_landmarks(frame: np.ndarray, landmark_data: Dict) -> np.ndarray:
         
         cv2.circle(frame, (x, y), radius, color, -1)
     
-    # Draw ROI box
+    # Draw ROI box (✓ tight mouth-focused crop)
     cv2.rectangle(
         frame,
         (roi_box['x_min'], roi_box['y_min']),
@@ -432,6 +459,12 @@ def draw_landmarks(frame: np.ndarray, landmark_data: Dict) -> np.ndarray:
     if len(landmark_data['corners_coords']) == 2:
         c1, c2 = landmark_data['corners_coords']
         cv2.line(frame, c1, c2, Config.COLOR_CORNERS, 2)
+    
+    # Draw tongue contour
+    if len(landmark_data['tongue_coords']) >= 2:
+        tongue = landmark_data['tongue_coords']
+        for i in range(len(tongue) - 1):
+            cv2.line(frame, tongue[i], tongue[i+1], Config.COLOR_TONGUE, 1)
     
     return frame
 
@@ -453,7 +486,7 @@ def draw_hud(frame: np.ndarray, state: str, label: str, elapsed: float,
     
     # Detection status
     if landmark_detected:
-        det_text = "✓ 40 LIP + 8 TEETH + FEATURES"
+        det_text = "✓ 40 LIP + 8 TEETH + 8 TONGUE (MOUTH-FOCUSED)"
         det_color = Config.COLOR_LIP_OUTER
     else:
         det_text = "⚠ NO DETECTION"
@@ -630,7 +663,8 @@ def save_frame_with_landmarks(frame: np.ndarray, frame_idx: int,
         frame = draw_landmarks(frame, landmark_data)
     
     frame_path = frames_dir / f"frame_{frame_idx:06d}.jpg"
-    cv2.imwrite(str(frame_path), frame)
+    # ✓ Optimized JPEG compression untuk faster write
+    cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return frame_path
 
 
@@ -652,6 +686,7 @@ def record_session(label: str, session_id: Optional[str] = None) -> Optional[Dic
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, Config.TARGET_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # ✓ Minimized buffer untuk fresh frame
     
     if not cap.isOpened():
         print("❌ Cannot open camera!")
@@ -667,7 +702,7 @@ def record_session(label: str, session_id: Optional[str] = None) -> Optional[Dic
     print(f"\n📷 Camera: {actual_width}x{actual_height} @ {actual_fps}fps")
     print(f"   Duration: {Config.RECORD_DURATION}s")
     print(f"   Expected frames: {actual_fps * Config.RECORD_DURATION}")
-    print(f"   Extracting: 40 lip + 8 teeth + 9 features")
+    print(f"   Extracting: 40 lip + 8 teeth + 8 tongue + 9 features (MOUTH-FOCUSED)")
     print(f"   Press [Q] to cancel\n")
     
     # Init video writer
@@ -687,6 +722,11 @@ def record_session(label: str, session_id: Optional[str] = None) -> Optional[Dic
     all_frames = []
     frame_count = 0
     landmark_count = 0
+    
+    # ✓ Frame timing untuk maintain FPS stabil
+    frame_interval = 1.0 / actual_fps
+    last_frame_time = time.time()
+    skipped_frames = 0
     
     print(f"▶ Countdown...\n")
     
@@ -794,11 +834,12 @@ def record_session(label: str, session_id: Optional[str] = None) -> Optional[Dic
         'landmarks_npy': str(paths['landmarks_npy']),
         'landmarks_csv': str(paths['landmarks_csv']),
         'features_csv': str(paths['features_csv']),
-        'total_landmarks': 50,
+        'total_landmarks': 58,
         'landmark_breakdown': {
             'lip_outer': 20,
             'lip_inner_aperture': 20,
             'teeth': 8,
+            'tongue': 8,
             'mouth_corners': 2,
         },
         'derived_features': 9,
@@ -858,10 +899,10 @@ def main():
     
     while True:
         print("\n" + "─" * 72)
-        label = input("  📝 Masukkan KATA (contoh: aku, halo, kamu, test)\n"
-                     "     Atau [exit] untuk keluar: ").strip().lower()
+        label = input("  📝 Masukkan KATA (contoh: aku, halo, kamu, test, q)\n"
+                     "     Atau ketik [exit] untuk keluar: ").strip().lower()
         
-        if label in ("exit", "quit", "q", ""):
+        if label in ("exit", "quit", ""):
             print("\n  👋 Sampai jumpa!\n")
             break
         
